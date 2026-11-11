@@ -30,6 +30,7 @@ En partida dedicada el servidor es el «rebroadcaster»: GameSetupConcrete ata e
 conexion con el servidor, y el servidor lo reenvia a las demas consolas. Con NBA_RIVAL_FALSO=1, lo
 dirigido a un jugador sin consola conectada se contesta en su nombre (eco "destinatario|remitente:texto").
 """
+import datetime
 import json
 import os
 import socket
@@ -143,9 +144,10 @@ class Servidor:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", PUERTO))
         self.conexiones = {}
-        self.inicio = time.monotonic()
         self.captura = open(CAPTURA, "a", encoding="ascii")
-        self.captura.write(f"# inicio {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        self.inicio = time.monotonic()
+        inicio_local = datetime.datetime.now().astimezone()
+        self.captura.write(f"# inicio {inicio_local.isoformat(sep=' ', timespec='milliseconds')}\n")
         self.cerrojo = threading.Lock()
         self.vistos = {}
         self.vistos_stream = {}

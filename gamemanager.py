@@ -149,7 +149,14 @@ def _equipo(p, j, slot):
     local/visitante por orden de entrada (antes TIDX = hueco: el tercero quedaba en un equipo inexistente)."""
     if "equipo" in j:
         return j["equipo"]
-    return slot % 2 if p["escenario"] else slot
+    if not p["escenario"]:
+        return slot
+    # Live Run: equipo inicial fijo desde la primera vez (antes se recalculaba por posicion y cambiaba al irse
+    # alguien). Alterna local/visitante; el cambio automatico de equipo al entrar lo pasa al otro, asi que los
+    # equipos finales quedan parejos.
+    if "equipo_ini" not in j:
+        j["equipo_ini"] = slot % 2
+    return j["equipo_ini"]
 
 
 def _jugador(p, j, slot, estado, red=None):
@@ -203,20 +210,12 @@ def _rol(j):
 
 
 def _rol_en_sala(p, j):
-    """Rol de Blaze del jugador en la sala de Live Run = su puesto en la alineacion de su equipo ("0", "1", "2"...).
-    La sala coloca a cada humano en el puesto de su rol (el cambio de equipo pidio el rol "2", traza 01:18); con
-    ANY_PLAYER_ROLE nadie ocupaba puesto: PC2 invisible y en el partido todos con la CPU."""
-    if "rol" in j:
-        return j["rol"]
-    jugadores = p["jugadores"]
-    k = jugadores.index(j) if j in jugadores else len(jugadores)
-    equipo = _equipo(p, j, k)
-    ocupados = {x.get("rol") for x in jugadores if x is not j and _equipo(p, x, jugadores.index(x)) == equipo}
-    previos = sum(1 for i, x in enumerate(jugadores[:k]) if _equipo(p, x, i) == equipo and "rol" not in x)
-    puesto = previos
-    while str(puesto) in ocupados:
-        puesto += 1
-    return str(puesto)
+    """Rol de Blaze del jugador en la sala de Live Run. Los roles "0".."2" son los puestos de la alineacion (la sala
+    pinta a cada humano en el puesto de su rol; traza 01:18). Al entrar el jugador no tiene puesto
+    (ANY_PLAYER_ROLE); el cambio de equipo automatico (requestSwap -> swapPlayers del admin) le da uno elegido por el
+    propio admin. Antes el servidor calculaba el puesto y lo recalculaba con cada entrada: con 3-4 jugadores las
+    consolas veian puestos distintos (un jugador en los dos equipos, otro sin puesto -> espectador)."""
+    return j.get("rol") or "ANY_PLAYER_ROLE"
 
 
 def _roles_partida(p):
@@ -464,8 +463,11 @@ def manejar(s, cmd, f):
                     if rol:
                         j["rol"] = rol
                     s.log(f"GameManager: {j['nombre']} pasa al equipo {tidx} (rol {rol!r})")
+                    if p.get("cambio_en_curso") is j:
+                        p["cambio_en_curso"] = None
+                        threading.Timer(0.5, _siguiente_cambio, (p,)).start()
             avisos.append((GAME_MANAGER, N_PLAYER_TEAM_ROLE_SLOT_CHANGE,
-                           [("GID ", V, p["gid"]), ("PID ", V, pid), ("ROLE", S, rol or "0"),
+                           [("GID ", V, p["gid"]), ("PID ", V, pid), ("ROLE", S, rol or "ANY_PLAYER_ROLE"),
                             ("SLOT", V, slot), ("TIDX", V, tidx)]))
         _a_todos(p, avisos)
         return []
@@ -650,26 +652,44 @@ def _aviso_puesto(p, j):
 
 def _avisar_puestos(p, r, jugadores):
     """Sala de Live Run: el jugador creado de cada humano solo aparece tras un cambio de equipo hecho por el flujo
-    del admin (TeamSwitchingManager: requestSwap -> switchStart -> swapPlayers -> syncQueue -> switchEnd). Un aviso
-    de cambio mandado por el servidor no basta (switchEnd sin homeBlazeId/awayBlazeId, sin redibujar; prueba 01:48).
-    Se manda, 3 s despues de unirse, un requestSwap en nombre del jugador (lo mismo que «Unirse al equipo …»)."""
+    del admin (TeamSwitchingManager: requestSwap -> switchStart -> swapPlayers -> syncQueue -> switchEnd). El
+    servidor manda un requestSwap en nombre de cada jugador que entra (lo mismo que «Unirse al equipo ...»), DE UNO EN
+    UNO: con 4 jugadores varios cambios a la vez se cruzaban en el admin."""
+    cola = p.setdefault("cambios_pend", [])
     for j in jugadores:
-        if j.get("cambio_inicial"):
-            continue
-        j["cambio_inicial"] = True
-
-        def pedir(j=j):
-            if p["gid"] not in _partidas or j not in p["jugadores"] or "equipo" in j:
-                return                               # se fue, o ya cambio de equipo por su cuenta
-            datos = b"\x01\x08blazeId\x00\x04" + str(j["uid"]).encode() + b"\x00\x09"
-            attr = [(7170404, "requestSwap"), (7239021, "1"), (1684108385, base64.b64encode(datos).decode()),
-                    (1718775661, str(j["uid"])), (1936292453, str(len(datos)))]
-            p["jugadores"][0]["sesion"].log(f"GameManager: requestSwap automatico de {j['nombre']} "
-                                            f"(para que la sala muestre su jugador)")
-            _a_todos(p, [_aviso_mensaje(j, attr, OBJ_GAME, [p["gid"]])])
-        t = threading.Timer(3.0, pedir)
+        if not j.get("cambio_inicial"):
+            j["cambio_inicial"] = True
+            cola.append(j)
+    if not p.get("cambio_en_curso"):
+        t = threading.Timer(3.0, _siguiente_cambio, (p,))
         t.daemon = True
         t.start()
+
+
+def _siguiente_cambio(p):
+    with _lock:
+        if p.get("cambio_en_curso") or p["gid"] not in _partidas:
+            return
+        cola = p.setdefault("cambios_pend", [])
+        while cola and (cola[0] not in p["jugadores"] or "equipo" in cola[0]):
+            cola.pop(0)                              # se fue, o ya cambio de equipo por su cuenta
+        if not cola:
+            return
+        j = p["cambio_en_curso"] = cola.pop(0)
+    datos = b"\x01\x08blazeId\x00\x04" + str(j["uid"]).encode() + b"\x00\x09"
+    attr = [(7170404, "requestSwap"), (7239021, "1"), (1684108385, base64.b64encode(datos).decode()),
+            (1718775661, str(j["uid"])), (1936292453, str(len(datos)))]
+    p["jugadores"][0]["sesion"].log(f"GameManager: requestSwap automatico de {j['nombre']} "
+                                    f"(para que la sala muestre su jugador)")
+    _a_todos(p, [_aviso_mensaje(j, attr, OBJ_GAME, [p["gid"]])])
+
+    def vencido():                                   # sin swapPlayers en 4 s: se sigue con el siguiente
+        if p.get("cambio_en_curso") is j:
+            p["cambio_en_curso"] = None
+            _siguiente_cambio(p)
+    t = threading.Timer(4.0, vencido)
+    t.daemon = True
+    t.start()
 
 
 def _avisar_entrada(p, invitado):

@@ -1,8 +1,10 @@
 # NBA LIVE 19 online – community server for shadPS4
 
-A server that replaces EA's (shut down) servers for **NBA LIVE 19** (PS4, CUSA11355 v1.00) so the **ranked 1 vs 1 match** can be played online with the [shadPS4](https://github.com/danilenko22/shadPS4/tree/nba19-fix) emulator (branch `nba19-fix`, which has the client-side changes).
+A server that replaces EA's (shut down) servers for **NBA LIVE 19** (PS4, CUSA11355 v1.00) so the **ranked 1 vs 1 match** and **Live Run 3 vs 3** can be played online with the [shadPS4](https://github.com/danilenko22/shadPS4/tree/nba19-fix) emulator (branch `nba19-fix`, which has the client-side changes).
 
 Tested between two PCs (Intel and AMD): pre-game, loading and full matches stay in sync.
+
+**Live Run 3 vs 3 (open lobby):** the lobby, team switching and the match work; each human controls their own created player and the CPU fills the free spots. Tested with 2 players so far. The game normally needs 4 human players before the lobby countdown starts; the `NBA19_online.xml` patch lowers that to 2 (see below).
 
 **Ready-to-use package (client + server):** see [Releases](https://github.com/danilenko22/nba19-online-servidor/releases).
 
@@ -12,7 +14,7 @@ Tested between two PCs (Intel and AMD): pre-game, loading and full matches stay 
 |---|---|
 | `servidor.py` | Entry point; HTTPS redirector (42230), fake Nucleus/OAuth (443), QoS (17502 TCP/UDP), web services (8088), ShadNet WebAPI proxy (31315), telemetry and ticker (9988, 8999). |
 | `blaze.py`, `tdf.py`, `nba.py` | EA's Blaze protocol (TDF "Heat2") on port 10041: login, configuration and the components the game asks for. |
-| `gamemanager.py` | Matchmaking and games with a **dedicated server topology** (the server hosts the game). |
+| `gamemanager.py` | Matchmaking and games with a **dedicated server topology** (the server hosts the game). Live Run: lobby created from the matchmaking scenario, Messaging relay for the lobby's own messages, lineup spots as Blaze roles, team switching. |
 | `juego.py` | **Match server** (UDP 7000): CommUDP, NetGameLink sync, rebroadcaster for the pre-game streams, and the server side of **NetGameDist** (distributes each frame's inputs and aligns the start of the match). |
 
 ## Usage
@@ -34,7 +36,7 @@ Ports: TCP 42230, 10041, 443, 8088, 31315, 9988, 8999, 17502 · UDP 17502, 7000.
 Each player uses the shadPS4 build from branch `nba19-fix` with:
 - `user/hosts.txt` sending `*.ea.com` and `srv.shadps4.net` to the server IP;
 - `NBA_GSRV=10.99.0.1:1899=<IP>:7000` (the match server is announced with a virtual IP);
-- the `NBA19_online.xml` patch and the game config with network and ShadNet enabled.
+- the `NBA19_online.xml` patch and the game config with network and ShadNet enabled. For Live Run the patch must include the entry **"Live Run: 2 jugadores para empezar"** (`Address="0x84B9FA" Value="02"`), which lowers the players needed to start from 4 to 2.
 
 The released package has all of that ready (`Client` folder).
 

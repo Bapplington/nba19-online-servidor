@@ -148,6 +148,26 @@ def campo(fields, tag, default=None):
     return default
 
 
+def config_live_run():
+    """NBA_LIVE_RUN: pabellones de Live Run (analizador 0xbeb2b00/0xbeb30c0 del volcado). Sin
+    VENUE_IDENTIFIER las listas de pabellones por TeamType quedan vacias y la simulacion divide por
+    cero (0xb91bfc2: pabellon al azar % 0). Valores = el pabellon RIO que el propio juego crea en
+    0xbeb1090 (modo de desarrollo)."""
+    overrides = ("score_to_win:21:should_win_on_score_or_higher:1:point_override_normal:2:"
+                 "point_override_perimeter:3:")
+    overrides += "".join(f"slider_gp_{lado}_{tipo}_collision_frequency_{q}:70:"
+                         for tipo in ("on_ground", "in_air") for lado in ("offensive", "defensive")
+                         for q in ("cpu", "user"))
+    rio = {"NAME": "NBA_SC_MAP_FAVELA_NAME", "ID": "30", "STADIUM_IDS": "4110:4110:",
+           "LOC": "NBA_SC_MAP_FAVELA_LOCATION", "IMG": "::", "IMG_ALT": "85:0:",
+           "IMG_LIBRARY": "venueMapRio3v3", "IMGKEY": "18", "X": "1897.0", "Y": "2625.0",
+           "DIFFICULTY": "1", "DIFFICULTY_LABEL": "NBA_SC_MAP_VENUE_DIFFICULTY_1",
+           "TEAM_TYPE": "TEAMTYPE_3V3", "OVERRIDES": overrides, "AWAY": "210", "HOME": "310"}
+    c = {"VENUE_IDENTIFIER": "RIO"}
+    c.update({f"RIO_{k}": v for k, v in rio.items()})
+    return c
+
+
 def config_h2h():
     """NBA_H2HSEASONS: claves leidas por el cliente (cadenas junto a "NBA_H2HSEASONS" en el eboot).
     Vacia -> "No se pudo conectar a Cara a cara igualada" (H2LSTCON). Valores supuestos; los
@@ -283,7 +303,11 @@ class Sesion:
         }
         if cfid == "NBA_H2HSEASONS":
             items[cfid] = config_h2h()
-        return sorted(items.get(cfid, {}).items())
+        if cfid == "NBA_LIVE_RUN":
+            items[cfid] = config_live_run()
+        # el cliente busca las claves con busqueda binaria sin distinguir mayusculas (0xd38f250 ->
+        # 0xb5762a0, tabla tolower): orden por bytes ("RIO_IMGKEY" < "RIO_IMG_ALT") rompia la busqueda
+        return sorted(items.get(cfid, {}).items(), key=lambda kv: kv[0].lower())
 
     def fetch_client_config(self, h, f):
         cfid = campo(f, "CFID", "")
@@ -487,6 +511,9 @@ class Sesion:
         if fn is None and h["component"] == gamemanager.GAME_MANAGER:
             r = gamemanager.manejar(self, h["command"], f)
             campos, notifs = r if isinstance(r, tuple) else (r, [])
+            return [self.reply(h, campos)] + [self.notify(c, n, x) for c, n, x in notifs], True
+        if fn is None and (h["component"], h["command"]) == (gamemanager.MESSAGING, 0x0001):
+            campos, notifs = gamemanager.mensaje(self, f)        # Messaging::sendMessage
             return [self.reply(h, campos)] + [self.notify(c, n, x) for c, n, x in notifs], True
         if fn is None and h["component"] in nba.MANEJADORES:
             r = nba.MANEJADORES[h["component"]](self, h["command"], f)

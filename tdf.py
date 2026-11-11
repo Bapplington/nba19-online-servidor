@@ -18,9 +18,12 @@ import os
 import struct
 from typing import Any, List, Optional, Tuple
 
-VARINT, STRING, BLOB, STRUCT, LIST, MAP, UNION, INTLIST, OBJTYPE, OBJID, FLOAT, TIME = range(12)
+VARINT, STRING, BLOB, STRUCT, LIST, MAP, UNION, INTLIST, OBJTYPE, OBJID, FLOAT, TIME, GENERIC = range(13)
 TYPE_NAMES = ["varint", "string", "blob", "struct", "list", "map", "union",
-              "intlist", "objtype", "objid", "float", "time"]
+              "intlist", "objtype", "objid", "float", "time", "generic"]
+# Generico (tipo 12, p. ej. scenarioAttributes de startMatchmakingScenario): [presente][id de tipo TDF]
+# [valor][00]. Visto en NBA LIVE 19: id 6 = cadena, 0x13/0x14 = enteros.
+GENERIC_STRING_IDS = {6}
 UNION_UNSET = 0x7F
 
 Field = Tuple[str, int, Any]
@@ -126,6 +129,13 @@ def _read_value(r: Reader, t: int, depth: int = 0) -> Any:
         return (r.varint(), r.varint(), r.varint())
     if t == FLOAT:
         return struct.unpack(">f", r.take(4))[0]
+    if t == GENERIC:
+        if r.u8() == 0:
+            return (None, None)
+        tid = r.varint()
+        v = _read_value(r, STRING if tid in GENERIC_STRING_IDS else VARINT, depth + 1)
+        r.u8()
+        return (tid, v)
     raise TdfError(f"unknown TDF type {t}")
 
 

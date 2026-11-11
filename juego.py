@@ -26,7 +26,7 @@ Sin sincronia del otro lado la consola corta la conexion a los ~15 s (DISC).
 
 Streams (tipo 0x0b, 0x4b si ademas lleva sincronia): 'str0' + subtipo ('ctrl') + u32 largo + datos.
 En partida dedicada el servidor es el «rebroadcaster»: GameSetupConcrete ata el canal 'ctrl' de la previa
-(CPreGame::SendToPeers, mensajes "remitente|destinatario:texto", p. ej. "danilenko|rival:hey") a la
+(CPreGame::SendToPeers, mensajes "remitente|destinatario:texto", p. ej. "player1|player2:hey") a la
 conexion con el servidor, y el servidor lo reenvia a las demas consolas. Con NBA_RIVAL_FALSO=1, lo
 dirigido a un jugador sin consola conectada se contesta en su nombre (eco "destinatario|remitente:texto").
 """

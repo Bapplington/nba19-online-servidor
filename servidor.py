@@ -76,7 +76,8 @@ _ultimo_nombre = [None]   # firstpartyid (nombre PSN) del ultimo getServerInstan
 
 
 def log(msg):
-    linea = f"[{datetime.datetime.now():%H:%M:%S.%f}] {msg}"
+    ahora = datetime.datetime.now().astimezone()
+    linea = f"[{ahora.isoformat(sep=' ', timespec='microseconds')}] {msg}"
     with _lock:
         print(linea, flush=True)
         with open(os.path.join(LOGS, "servidor.log"), "a", encoding="utf-8") as f:

@@ -15,6 +15,7 @@ CommUDP (recepcion del cliente en 0xd6c6500, maquina de estados en 0xd6c7090):
   seq < 0x100 es control: 1 INIT, 2 CONN, 3 DISC, 4 NAK, 5 POKE. Cuerpo de INIT/CONN/POKE:
   [u32 id de cliente][u8 u8 opciones = 01 01]; el ack lleva el ident de conexion, que debe coincidir.
   INIT o POKE -> se contesta CONN (el cliente pasa de 'conectando' (2) a 'conectado' (4)).
+  NAK (4) lleva el primer numero faltante en el segundo u32, sin cuerpo.
   Datos fiables desde 0x100. Agrupados: cada subpaquete extra lleva su longitud al final (1 byte si
   < 0xfb, si no 2 bytes: (b<<8)+prev-0xfa05); desde el final salen del mas antiguo (seq-n) al mas nuevo,
   y lo que queda delante es el de numero seq. Un paquete vacio con seq = siguiente es keepalive/ACK.
@@ -142,6 +143,8 @@ class Conexion:
         self.entradas = deque()           # entradas de NetGameDist aun no repartidas
         self.input_progress = time.monotonic()
         self.reordered = {}
+        self.last_nak_sent = None
+        self.last_nak_reply = None
         self.duplicate_packets = 0
         self.dropped_packets = 0
         self.recovered_packets = 0
@@ -283,6 +286,30 @@ class Servidor:
         self.enviar(c.origen, struct.pack(">II", c.sig_envio, c.ack()))
         c.ultimo_tx = time.monotonic()
 
+    def _request_missing(self, c, now):
+        if not c.reordered:
+            return
+        previous = c.last_nak_sent
+        if previous and previous[0] == c.esperado and now - previous[1] < REENVIO:
+            return
+        c.last_nak_sent = (c.esperado, now)
+        self.enviar(c.origen, struct.pack(">II", NAK, c.esperado))
+        self._diag("udp_missing_requested", c, expected=c.esperado,
+                   reorder_queue=len(c.reordered))
+
+    def _reply_to_nak(self, c, seq):
+        pending = c.pendientes.get(seq)
+        if pending is None:
+            return
+        now = time.monotonic()
+        previous = c.last_nak_reply
+        if previous and now - previous < REENVIO:
+            return
+        c.last_nak_reply = now
+        self.enviar(c.origen, struct.pack(">II", seq, c.ack()) + pending[8:])
+        c.ultimo_tx = now
+        self._diag("udp_nak_retransmit", c, seq=seq, unacked=len(c.pendientes))
+
     def _control(self, origen, tipo, ident, cuerpo):
         texto = f"{origen[0]}:{origen[1]}"
         c = self.conexiones.get(origen)
@@ -303,6 +330,9 @@ class Servidor:
                 self._keepalive(c)
         elif tipo == CONN:
             self.log(f"juego: {texto} manda CONN (ident {ident:08x})")
+        elif tipo == NAK:
+            if c is not None and c.conectada and not cuerpo:
+                self._reply_to_nak(c, ident)
         elif tipo == DISC:
             if c is not None and ident == c.ident:
                 self._end_stalled_match(c, "client_disconnect", notify=False)
@@ -349,6 +379,7 @@ class Servidor:
                 self._diag("udp_gap_recovered", c, recovered=recovered,
                            recovered_total=c.recovered_packets, next_seq=c.esperado,
                            reorder_queue=len(c.reordered), duplicates_total=c.duplicate_packets)
+        self._request_missing(c, time.monotonic())
         if nuevos and c.sinc_rx:
             self._sincronia(c)
         else:
@@ -562,6 +593,8 @@ class Servidor:
                 for origen, c in list(self.conexiones.items()):
                     if self.conexiones.get(origen) is not c:
                         continue
+                    if c.conectada and ahora - c.ultimo_rx <= TIMEOUT:
+                        self._request_missing(c, ahora)
                     if ahora - c.ultimo_rx > TIMEOUT:
                         self._end_stalled_match(c, "idle_timeout")
                     elif not c.conectada:

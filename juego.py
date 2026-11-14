@@ -30,6 +30,7 @@ En partida dedicada el servidor es el «rebroadcaster»: GameSetupConcrete ata e
 conexion con el servidor, y el servidor lo reenvia a las demas consolas. Con NBA_RIVAL_FALSO=1, lo
 dirigido a un jugador sin consola conectada se contesta en su nombre (eco "destinatario|remitente:texto").
 """
+from collections import deque
 import datetime
 import json
 import os
@@ -61,6 +62,16 @@ TIMEOUT = 15.0                   # s sin recibir nada -> conexion olvidada
 
 INIT, CONN, DISC, NAK, POKE = 1, 2, 3, 4, 5
 INTERVALO_DIAG = 5.0
+REORDER_WINDOW = 64
+MAX_INPUT_QUEUE = 240
+MAX_UNACKED = 512
+INPUT_STALL = 5.0
+SEQ_START = 0x100
+SEQ_SPAN = 0x1000000 - SEQ_START
+
+
+def _ahead(start, end):
+    return (end - start) % SEQ_SPAN
 
 
 def _sig(seq):
@@ -80,13 +91,15 @@ def _subpaquetes(seq, extra, cuerpo):
     num = _ant(seq, extra)
     for _ in range(extra):
         if not cuerpo:
-            return salida
+            return []
         b = cuerpo[-1]
         if b >= 0xFB and len(cuerpo) >= 2:
             largo, usados = (b << 8) + cuerpo[-2] - 0xFA05, 2
         else:
             largo, usados = b, 1
         cuerpo = cuerpo[:-usados]
+        if not 0 < largo <= len(cuerpo):
+            return []
         salida.append((num, cuerpo[len(cuerpo) - largo:]))
         cuerpo = cuerpo[:len(cuerpo) - largo]
         num = _sig(num)
@@ -126,7 +139,12 @@ class Conexion:
         self.sinc_rx = 0             # sincronias recibidas desde la ultima que mandamos
         self.sinc_tx = 0
         self.nombre = None           # persona de la consola (sale de los mensajes "nombre|...")
-        self.entradas = []           # entradas de NetGameDist aun no repartidas
+        self.entradas = deque()           # entradas de NetGameDist aun no repartidas
+        self.input_progress = time.monotonic()
+        self.reordered = {}
+        self.duplicate_packets = 0
+        self.dropped_packets = 0
+        self.recovered_packets = 0
         self.entradas_rx = 0
         self.multis_tx = 0
         self.flujo_visto = False
@@ -204,6 +222,8 @@ class Servidor:
         num = c.sig_envio
         c.sig_envio = _sig(num)
         paquete = struct.pack(">II", num, c.ack()) + carga
+        if not c.pendientes:
+            c.ultimo_reenvio = time.monotonic()
         c.pendientes[num] = paquete
         self.enviar(c.origen, paquete)
         c.ultimo_tx = time.monotonic()
@@ -222,14 +242,38 @@ class Servidor:
         if c.sinc_tx <= 3:
             self.log(f"juego: sincronia #{c.sinc_tx} -> {c.origen[0]}:{c.origen[1]}: {carga.hex()}")
 
+    def _end_connection(self, c, cause, *, notify=False):
+        if self.conexiones.get(c.origen) is not c:
+            return
+        if notify:
+            self.enviar(c.origen, struct.pack(">II", DISC, c.ident))
+        del self.conexiones[c.origen]
+        self._diag("player_disconnected", c, inmediato=True, cause=cause,
+                   idle_ms=int((time.monotonic() - c.ultimo_rx) * 1000),
+                   input_queue=len(c.entradas), unacked=len(c.pendientes),
+                   reorder_queue=len(c.reordered))
+
+    def _end_stalled_match(self, c, cause, *, notify=True):
+        import gamemanager
+        slot = gamemanager.puesto_dist(c.id_cliente)
+        peers = set(slot[2]) if slot and c.entradas_rx else set()
+        self._end_connection(c, cause, notify=notify)
+        for peer in list(self.conexiones.values()):
+            if peer.conectada and peer.id_cliente in peers:
+                self._end_connection(peer, "match_peer_" + cause, notify=True)
+
     def _ack_recibido(self, c, ack):
-        if ack == SIN_ACK:
+        if not c.pendientes or not SEQ_START <= ack < 0x1000000 or ack == SIN_ACK:
+            return
+        oldest = next(iter(c.pendientes))
+        covered = _ahead(oldest, ack)
+        if covered >= _ahead(oldest, c.sig_envio):
             return
         antes = len(c.pendientes)
         for num in list(c.pendientes):
-            # numeros en ventana: los <= ack (sin vuelta del contador en la practica)
-            if num <= ack:
-                del c.pendientes[num]
+            if _ahead(oldest, num) > covered:
+                break
+            del c.pendientes[num]
         retirados = antes - len(c.pendientes)
         if retirados:
             self._diag("ack_aplicado", c, ack=ack, retirados=retirados,
@@ -246,8 +290,7 @@ class Servidor:
             id_cliente = struct.unpack(">I", cuerpo[:4])[0] if len(cuerpo) >= 4 else 0
             if c is None or c.ident != ident:
                 if c is not None:
-                    self._diag("jugador_sale", c, inmediato=True, motivo="ident_nuevo",
-                               pendientes=len(c.pendientes))
+                    self._end_connection(c, "connection_replaced")
                 c = Conexion(origen, ident, id_cliente)
                 self.conexiones[origen] = c
                 self.log(f"juego: {texto} pide conexion (tipo {tipo}, ident {ident:08x}, cliente {id_cliente:08x})")
@@ -261,11 +304,8 @@ class Servidor:
         elif tipo == CONN:
             self.log(f"juego: {texto} manda CONN (ident {ident:08x})")
         elif tipo == DISC:
-            self.log(f"juego: {texto} se desconecta (ident {ident:08x})")
-            self.conexiones.pop(origen, None)
-            if c is not None:
-                self._diag("jugador_sale", c, inmediato=True, motivo="disc",
-                           ident_cabecera=ident, pendientes=len(c.pendientes))
+            if c is not None and ident == c.ident:
+                self._end_stalled_match(c, "client_disconnect", notify=False)
         else:
             self.log(f"juego: {texto} control tipo {tipo} ident {ident:08x} cuerpo {cuerpo.hex()}")
 
@@ -277,34 +317,62 @@ class Servidor:
         if not cuerpo:
             return                                  # keepalive/ACK de la consola
         nuevos = 0
-        for n, sub in _subpaquetes(num, extra, cuerpo):
+        subpaquetes = _subpaquetes(num, extra, cuerpo)
+        if not subpaquetes or any(n < SEQ_START or not sub for n, sub in subpaquetes):
+            c.dropped_packets += 1
+            self._diag("udp_packet_invalid", c, seq=num, dropped_total=c.dropped_packets)
+            return
+        for n, sub in subpaquetes:
             if n != c.esperado:
-                self._diag("seq_no_esperada", c, seq=n, esperado=c.esperado, ack=ack)
-                continue                            # repetido (ya entregado) o fuera de orden
-            c.esperado = _sig(c.esperado)
-            c.recibidos += 1
+                offset = _ahead(c.esperado, n)
+                if n in c.reordered or offset > SEQ_SPAN // 2:
+                    c.duplicate_packets += 1
+                    self._diag("udp_packet_duplicate", c, seq=n, duplicates_total=c.duplicate_packets)
+                elif offset <= REORDER_WINDOW:
+                    c.reordered[n] = sub
+                    self._diag("udp_packet_buffered", c, seq=n, expected=c.esperado,
+                               reorder_queue=len(c.reordered))
+                else:
+                    c.dropped_packets += 1
+                    self._diag("udp_packet_outside_window", c, seq=n, expected=c.esperado,
+                               dropped_total=c.dropped_packets)
+                continue
+            self._deliver(c, n, sub)
             nuevos += 1
-            if sub and sub[-1] & 0x40 and len(sub) < 17:
-                self._diag("sincronia_corta", c, seq=n, bytes=len(sub))
-            if sub and sub[-1] & 0x40 and len(sub) >= 17:
-                c.hora_otro = (struct.unpack(">I", sub[-17:-13])[0], time.monotonic())
-                c.sinc_rx += 1
-                self._diag("sincronia_rx", c, seq=n, reloj_cliente_ms=c.hora_otro[0])
-                if sub[-1] == 0x40 and len(sub) == 17 and c.recibidos > 3:
-                    continue                        # sincronia sola: no llenar el log
-            if sub and (sub[-1] & 0x3F) == TIPO_STREAM:
-                self._stream(c, sub[:-17] if sub[-1] & 0x40 else sub[:-1])
-                continue
-            if sub and (sub[-1] & 0x3F) in (TIPO_ENTRADA, TIPO_FLUJO):
-                self._dist(c, sub[-1] & 0x3F, sub[:-17] if sub[-1] & 0x40 else sub[:-1])
-                continue
-            if c.recibidos <= 200 or c.recibidos % 1000 == 0:
-                self.log(f"juego: {c.origen[0]}:{c.origen[1]} #{n:#x} {describir_ngl(sub)}")
-        # respuesta inmediata: sincronia nueva (lleva el ACK) o, si no, ACK vacio
+            recovered = 0
+            while c.esperado in c.reordered:
+                buffered_seq = c.esperado
+                self._deliver(c, buffered_seq, c.reordered.pop(buffered_seq))
+                recovered += 1
+            if recovered:
+                c.recovered_packets += recovered
+                self._diag("udp_gap_recovered", c, recovered=recovered,
+                           recovered_total=c.recovered_packets, next_seq=c.esperado,
+                           reorder_queue=len(c.reordered), duplicates_total=c.duplicate_packets)
         if nuevos and c.sinc_rx:
             self._sincronia(c)
         else:
             self._keepalive(c)
+
+    def _deliver(self, c, n, sub):
+        c.esperado = _sig(c.esperado)
+        c.recibidos += 1
+        if sub and sub[-1] & 0x40 and len(sub) < 17:
+            self._diag("sincronia_corta", c, seq=n, bytes=len(sub))
+        if sub and sub[-1] & 0x40 and len(sub) >= 17:
+            c.hora_otro = (struct.unpack(">I", sub[-17:-13])[0], time.monotonic())
+            c.sinc_rx += 1
+            self._diag("sincronia_rx", c, seq=n, reloj_cliente_ms=c.hora_otro[0])
+            if sub[-1] == 0x40 and len(sub) == 17 and c.recibidos > 3:
+                return
+        if sub and (sub[-1] & 0x3F) == TIPO_STREAM:
+            self._stream(c, sub[:-17] if sub[-1] & 0x40 else sub[:-1])
+            return
+        if sub and (sub[-1] & 0x3F) in (TIPO_ENTRADA, TIPO_FLUJO):
+            self._dist(c, sub[-1] & 0x3F, sub[:-17] if sub[-1] & 0x40 else sub[:-1])
+            return
+        if c.recibidos <= 200 or c.recibidos % 1000 == 0:
+            self.log(f"juego: {c.origen[0]}:{c.origen[1]} #{n:#x} {describir_ngl(sub)}")
 
     def _stream(self, c, cuerpo):
         """Paquete de stream de NetGameLink (sin sincronia ni byte de tipo): se reenvia a las demas consolas."""
@@ -353,29 +421,39 @@ class Servidor:
                 self.log(f"juego: dist {c.nombre or c.origen[0]}: flujo {cuerpo.hex()} -> se contesta igual")
             self._enviar_fiable(c, cuerpo + bytes([TIPO_FLUJO]))
             return
+        if not c.entradas:
+            c.input_progress = time.monotonic()
         c.entradas.append(cuerpo)
         c.entradas_rx += 1
         if not _es_marcador(cuerpo):
             c.real = True
         if c.entradas_rx <= 3 or c.entradas_rx in (10, 100, 1000, 10000):
             self.log(f"juego: dist {c.nombre or c.origen[0]}: entrada #{c.entradas_rx} {cuerpo.hex()}")
-        self._repartir()
+        self._repartir(c)
         if len(c.entradas) > 1:
-            self._diag("fotograma_en_espera", c, entradas_rx=c.entradas_rx,
-                       entradas_pendientes=len(c.entradas), multis_tx=c.multis_tx)
+            self._diag("frame_queue_waiting", c, inputs_received=c.entradas_rx,
+                       input_queue=len(c.entradas), multis_sent=c.multis_tx,
+                       unacked=len(c.pendientes), reorder_queue=len(c.reordered))
 
-    def _repartir(self):
+    def _repartir(self, source):
         """Fotograma completo cuando todas las consolas tienen una entrada pendiente: a cada una se le manda
         un multi con las de las demas. Formato (decodificador 0xd6d2450; n = huecos de NetGameDist):
           [n de entradas propias que consume este fotograma = 1]
           [tipos: un nibble por cada OTRO jugador, bajo/alto alternando; 2/3 = entrada con datos, 1 = nada]
           [longitudes (1 byte) de los otros menos el ultimo, cuyo tamano es lo que queda]
           [entradas de los otros, en orden de indice]"""
-        conectadas = [o for o in self.conexiones.values() if o.conectada]
+        import gamemanager
+        source_slot = gamemanager.puesto_dist(source.id_cliente)
+        roster = set(source_slot[2]) if source_slot else None
+        conectadas = [o for o in self.conexiones.values() if o.conectada
+                      and (o.id_cliente in roster if roster is not None
+                           else gamemanager.puesto_dist(o.id_cliente) is None)]
         cons = [o for o in conectadas if o.entradas_rx]
         if not cons or (not RIVAL_FALSO and (len(cons) < 2 or len(cons) < len(conectadas))):
             return                                   # se espera a que todas las consolas manden entradas
-        import gamemanager
+        if roster is not None and not RIVAL_FALSO and (
+                len(cons) != len(roster) or {o.id_cliente for o in cons} != roster):
+            return
         while True:
             # Alineacion de fotogramas: el fotograma 0 del partido de cada consola es su primera entrada real
             # (tras dejar el marcador de 1 byte). En cuanto alguna manda entradas reales, los marcadores que
@@ -385,11 +463,14 @@ class Servidor:
             if len(cons) > 1 and any(o.real for o in cons):
                 for o in cons:
                     while o.entradas and _es_marcador(o.entradas[0]):
-                        o.entradas.pop(0)
+                        o.entradas.popleft()
                         o.descartadas += 1
             if not all(o.entradas for o in cons):
                 break
-            fotograma = [(o, o.entradas.pop(0)) for o in cons]
+            fotograma = [(o, o.entradas.popleft()) for o in cons]
+            now = time.monotonic()
+            for o in cons:
+                o.input_progress = now
             por_uid = {x.id_cliente: e for x, e in fotograma}
             for o, propia in fotograma:
                 # el NetGameDist del cliente tiene un hueco mas que jugadores (dist+0x123c = 3 en un 1 contra 1,
@@ -462,12 +543,13 @@ class Servidor:
             return
         seq, ack = struct.unpack(">II", datos[:8])
         self._diag_paquete("udp_rx", c, seq, ack, len(datos))
-        if c is not None:
-            c.ultimo_rx = time.monotonic()
-            self._ack_recibido(c, ack)
-        if (seq & 0xFFFFFF) < 0x100:
+        if (seq & 0xFFFFFF) < SEQ_START:
+            if c is not None and ack == c.ident:
+                c.ultimo_rx = time.monotonic()
             self._control(origen, seq & 0xFFFFFF, ack, datos[8:])
         elif c is not None and c.conectada:
+            c.ultimo_rx = time.monotonic()
+            self._ack_recibido(c, ack)
             self._datos(c, seq, ack, datos)
         else:
             self._diag_paquete("udp_sin_conexion", c, seq, ack, len(datos))
@@ -478,20 +560,23 @@ class Servidor:
             ahora = time.monotonic()
             with self.cerrojo:
                 for origen, c in list(self.conexiones.items()):
+                    if self.conexiones.get(origen) is not c:
+                        continue
                     if ahora - c.ultimo_rx > TIMEOUT:
-                        self.log(f"juego: {origen[0]}:{origen[1]} sin noticias en {TIMEOUT:.0f} s, se olvida")
-                        del self.conexiones[origen]
-                        self._diag("jugador_sale", c, inmediato=True, motivo="timeout",
-                                   inactivo_ms=int((ahora - c.ultimo_rx) * 1000),
-                                   pendientes=len(c.pendientes))
+                        self._end_stalled_match(c, "idle_timeout")
                     elif not c.conectada:
                         continue
-                    elif c.pendientes and ahora - c.ultimo_reenvio >= REENVIO and ahora - c.ultimo_tx >= REENVIO:
-                        num = min(c.pendientes)
-                        paquete = struct.pack(">II", num, c.ack()) + c.pendientes[num][8:]
+                    elif len(c.pendientes) >= MAX_UNACKED:
+                        self._end_stalled_match(c, "unacked_limit")
+                    elif len(c.entradas) >= MAX_INPUT_QUEUE or (
+                            c.real and c.entradas and ahora - c.input_progress >= INPUT_STALL):
+                        self._end_stalled_match(c, "input_queue_stalled")
+                    elif c.pendientes and ahora - c.ultimo_reenvio >= REENVIO:
+                        num, pending = next(iter(c.pendientes.items()))
+                        paquete = struct.pack(">II", num, c.ack()) + pending[8:]
                         self.enviar(origen, paquete)
                         c.ultimo_reenvio = c.ultimo_tx = ahora
-                        self._diag("reenvio", c, seq=num, ack=c.ack(), pendientes=len(c.pendientes))
+                        self._diag("udp_retransmit", c, seq=num, ack=c.ack(), unacked=len(c.pendientes))
                     elif ahora - c.ultima_sinc >= SINCRONIA:
                         self._sincronia(c)
                     elif ahora - c.ultimo_tx >= KEEPALIVE:
